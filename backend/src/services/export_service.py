@@ -93,6 +93,7 @@ def attributions_csv(db: Session) -> bytes:
 
 def report_csv(db: Session, report: Report) -> bytes:
     snapshot = report.snapshot or {}
+    drilldown = snapshot.get("drilldown") or {}
     headers = ["项", "值"]
     rows: list[list[object]] = [
         ["报告编号", report.report_no],
@@ -102,6 +103,7 @@ def report_csv(db: Session, report: Report) -> bytes:
         ["影响金额合计(元)", f"{report.impact_total:.2f}"],
         ["生成人", report.generated_by],
         ["数据窗口", f"{snapshot.get('data_window', {}).get('start', '')} ~ {snapshot.get('data_window', {}).get('end', '')}"],
+        ["归因口径版本", f"v{snapshot.get('attribution_version', 1)}（与归因下钻同版）"],
         ["口径", snapshot.get("method", "")],
         ["", ""],
         ["严重度", "起数"],
@@ -116,29 +118,99 @@ def report_csv(db: Session, report: Report) -> bytes:
     rows.append(["拖累门店", "影响金额(元)"])
     for item in snapshot.get("top_drag_stores", []):
         rows.append([item.get("store", ""), item.get("impact", 0)])
+    if drilldown:
+        rows.append(["", ""])
+        rows.append(["渠道拖累（渠道×房型下钻汇总）", "变动(元)"])
+        for item in drilldown.get("channel", []):
+            rows.append([item.get("key", ""), item.get("delta", 0)])
+        rows.append(["房型拖累", "变动(元)"])
+        for item in drilldown.get("room_type", []):
+            rows.append([item.get("key", ""), item.get("delta", 0)])
+        if drilldown.get("unallocated_total"):
+            rows.append(["未分配差额合计(元)", drilldown["unallocated_total"]])
+            for item in drilldown.get("unallocated_reasons", []):
+                rows.append([f"未分配原因：{item.get('reason', '')}", f"{item.get('count', 0)} 起"])
     return to_csv(headers, rows)
 
 
 def channels_csv(db: Session) -> bytes:
     rows = db.scalars(select(Attribution)).all()
-    headers = ["门店", "指标日期", "维度", "分组", "当期", "基线", "变动", "贡献占比"]
+    anomalies = {row.id: row for row in db.scalars(select(Anomaly)).all()}
+    headers = ["门店", "指标日期", "归因版本", "维度", "层级", "分组", "当期", "基线", "变动", "贡献占比", "备注"]
     body = []
     for row in rows:
         store = db.get(Store, row.store_id)
+        anomaly = anomalies.get(row.anomaly_id)
+        store_name = store.name if store else ""
+        metric_date = anomaly.metric_date.isoformat() if anomaly else ""
+        version = f"v{row.version or 1}"
         dimensions = row.dimensions or {}
         for key in ("channel", "store", "room_type"):
             block = dimensions.get(key) or {}
             for item in block.get("rows", []):
                 body.append(
                     [
-                        store.name if store else "",
-                        row.anomaly_id,
+                        store_name,
+                        metric_date,
+                        version,
                         block.get("label", key),
+                        "分组",
                         item.get("key", ""),
                         item.get("current", ""),
                         item.get("base", ""),
                         item.get("delta", ""),
                         "" if item.get("contribution") is None else f"{item['contribution']:.4f}",
+                        "",
+                    ]
+                )
+        drilldown = dimensions.get("channel_room_type") or {}
+        for block in drilldown.get("channels", []):
+            body.append(
+                [
+                    store_name,
+                    metric_date,
+                    version,
+                    drilldown.get("label", "渠道 × 房型"),
+                    "渠道",
+                    block.get("label", ""),
+                    block.get("current", ""),
+                    block.get("base", ""),
+                    block.get("delta", ""),
+                    "" if block.get("contribution") is None else f"{block['contribution']:.4f}",
+                    block.get("status_label", ""),
+                ]
+            )
+            for room in block.get("room_types", []):
+                body.append(
+                    [
+                        store_name,
+                        metric_date,
+                        version,
+                        drilldown.get("label", "渠道 × 房型"),
+                        "房型",
+                        f"{block.get('label', '')} / {room.get('key', '')}",
+                        room.get("current", ""),
+                        room.get("base", ""),
+                        room.get("delta", ""),
+                        "" if room.get("contribution") is None else f"{room['contribution']:.4f}",
+                        "",
+                    ]
+                )
+            gap = block.get("unallocated")
+            if gap:
+                body.append(
+                    [
+                        store_name,
+                        metric_date,
+                        version,
+                        drilldown.get("label", "渠道 × 房型"),
+                        "未分配",
+                        f"{block.get('label', '')} / 未分配差额",
+                        "",
+                        "",
+                        gap.get("delta", ""),
+                        "",
+                        gap.get("reason", ""),
                     ]
                 )
     return to_csv(headers, body)

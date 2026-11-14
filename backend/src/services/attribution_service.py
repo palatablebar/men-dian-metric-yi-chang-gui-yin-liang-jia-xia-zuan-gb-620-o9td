@@ -1,9 +1,16 @@
-"""归因服务：量价分解（算法 B）+ 门店/渠道/房型三维贡献 + 结论文本。"""
+"""归因服务：量价分解（算法 B）+ 门店/渠道/房型三维贡献 + 渠道×房型下钻 + 结论文本。
+
+幂等与版本口径：
+- 同一异常重跑不重复生成归因、不改变既有结论（自然键唯一 + 既有行直接返回）；
+- 归因行带口径版本（room_type_drilldown.ATTRIBUTION_VERSION），报告与下钻引用同一版本；
+- 生成中断时事务整体回滚，完整旧版保持可用，不会留下半截新版。
+"""
 from __future__ import annotations
 
 from datetime import date, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.constants.enums import CHANNEL_LABELS, CHANNEL_ORDER, METRIC_LABELS
@@ -11,7 +18,7 @@ from src.models.anomaly import Anomaly
 from src.models.attribution import Attribution
 from src.models.metric import MetricPoint
 from src.models.store import Store
-from src.services import decompose, metric_service
+from src.services import decompose, metric_service, room_type_drilldown
 from src.utils.errors import not_found
 from src.utils.timeutil import iso_utc, parse_date
 
@@ -26,6 +33,7 @@ def serialize(attribution: Attribution, anomaly: Anomaly | None = None, store: S
         "metric_date": anomaly.metric_date.isoformat() if anomaly else None,
         "metric_key": anomaly.metric_key if anomaly else None,
         "metric_label": METRIC_LABELS.get(anomaly.metric_key, anomaly.metric_key) if anomaly else None,
+        "version": attribution.version or 1,
         "method": attribution.method,
         "status": attribution.status,
         "base_rev": round(attribution.base_rev, 2),
@@ -56,9 +64,14 @@ def _window_range(anomaly: Anomaly) -> tuple[date, date]:
     return start, end
 
 
+def _stratum(anomaly: Anomaly) -> bool:
+    """检测基线的周末/工作日分层（与算法 A 同一口径）。"""
+    return anomaly.metric_date.weekday() >= 5
+
+
 def _channel_rows(db: Session, anomaly: Anomaly) -> list[dict]:
     start, end = _window_range(anomaly)
-    window = metric_service.channel_window(db, anomaly.store_id, start, end)
+    window = metric_service.channel_window(db, anomaly.store_id, start, end, _stratum(anomaly))
     current = metric_service.channel_split(db, anomaly.store_id, anomaly.metric_date)
     groups = []
     for channel in CHANNEL_ORDER:
@@ -102,12 +115,28 @@ def _region_store_rows(db: Session, anomaly: Anomaly) -> list[dict]:
     return groups
 
 
-def _room_type_rows(store: Store, total: float, delta: float) -> list[dict]:
-    mix = {"大床房": 0.52, "双床房": 0.36, "套房": 0.12}
-    groups = []
-    for name, share in mix.items():
-        groups.append({"key": name, "value": round(total * share, 2), "base": round((total - delta) * share, 2)})
-    return groups
+def _channel_room_type_block(db: Session, anomaly: Anomaly, store_base_rev: float, store_cur_rev: float) -> dict:
+    """按各渠道逐日上报的房型结构构建渠道×房型下钻（v2 口径，逐层对账）。"""
+    start, end = _window_range(anomaly)
+    stratum = _stratum(anomaly)
+    window = metric_service.channel_window(db, anomaly.store_id, start, end, stratum)
+    current_rev = metric_service.channel_split(db, anomaly.store_id, anomaly.metric_date)
+    current_mix = metric_service.channel_mixes(db, anomaly.store_id, anomaly.metric_date)
+    window_mix = metric_service.channel_mix_window(db, anomaly.store_id, start, end, stratum)
+    channels = []
+    for channel in CHANNEL_ORDER:
+        _, base_mix, _ = room_type_drilldown.mean_mix(window_mix.get(channel, []))
+        channels.append(
+            {
+                "channel": channel,
+                "label": CHANNEL_LABELS.get(channel, channel),
+                "current": current_rev.get(channel, 0.0),
+                "base": metric_service.median(window.get(channel, [])) if window.get(channel) else 0.0,
+                "mix_current": current_mix.get(channel),
+                "mix_base": base_mix or None,
+            }
+        )
+    return room_type_drilldown.build_drilldown(channels, store_cur_rev, store_base_rev)
 
 
 def build(db: Session, anomaly: Anomaly, store: Store | None = None) -> Attribution:
@@ -135,21 +164,33 @@ def build(db: Session, anomaly: Anomaly, store: Store | None = None) -> Attribut
     channel_rows = _channel_rows(db, anomaly)
     channel_rank = decompose.rank_contributions(channel_rows, result["total_delta"])
     store_rank = decompose.rank_contributions(_region_store_rows(db, anomaly), result["total_delta"])
-    room_rows = _room_type_rows(store, triple_cur["revenue"], result["total_delta"])
+    # 门店总量口径：优先取检测载荷里的营收三元组（任何指标异常都是营收口径），与 LMDI 同源
+    store_base_rev = float(base.get("revenue") or anomaly.baseline)
+    store_cur_rev = float(current.get("revenue") or anomaly.observed)
+    drilldown = _channel_room_type_block(db, anomaly, store_base_rev, store_cur_rev)
+    room_rows = room_type_drilldown.aggregate_room_types(drilldown)
     room_rank = decompose.rank_contributions(room_rows, result["total_delta"])
 
     dimensions = {
         "channel": {"label": "渠道", "rows": channel_rank["rows"], "top_negative": channel_rank["top_negative"], "top_positive": channel_rank["top_positive"]},
         "store": {"label": "门店（同区域）", "rows": store_rank["rows"], "top_negative": store_rank["top_negative"], "top_positive": store_rank["top_positive"]},
-        "room_type": {"label": "房型（按房型结构分摊）", "rows": room_rank["rows"], "top_negative": room_rank["top_negative"], "top_positive": room_rank["top_positive"]},
+        "room_type": {"label": "房型（渠道上报结构汇总）", "rows": room_rank["rows"], "top_negative": room_rank["top_negative"], "top_positive": room_rank["top_positive"]},
+        "channel_room_type": drilldown,
     }
     narrative = decompose.narrative(
         result, channel_rank["rows"], store.name if store else anomaly.payload.get("store_code", ""), anomaly.metric_date.isoformat()
     )
+    if room_rank["top_negative"] and room_rank["top_negative"][0].get("contribution") is not None:
+        top = room_rank["top_negative"][0]
+        narrative += f" 房型层面「{top['key']}」变动 {top['delta']:+,.0f} 元（占 {top['contribution'] * 100:+.1f}%），按渠道逐日上报结构分摊。"
+    unallocated_total = drilldown["reconciliation"]["unallocated_total"]
+    if abs(unallocated_total) > 0.01:
+        narrative += f" 另有 {unallocated_total:+,.0f} 元因房型结构缺失或占比异常未分配到房型，已单列未分配差额。"
     shares = result["shares"]
     attribution = Attribution(
         anomaly_id=anomaly.id,
         store_id=anomaly.store_id,
+        version=room_type_drilldown.ATTRIBUTION_VERSION,
         method=result["method"],
         status=result["status"],
         base_rev=triple_base["revenue"],
@@ -183,7 +224,12 @@ def get_by_anomaly(db: Session, anomaly_id: int) -> dict:
         if anomaly is None:
             raise not_found("anomaly", anomaly_id)
         attribution = build(db, anomaly)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # 并发下另一请求已按自然键生成：回滚后复用既有行，不重复生成、不改变既有结论
+            db.rollback()
+            attribution = db.scalar(select(Attribution).where(Attribution.anomaly_id == anomaly_id))
     anomaly = db.get(Anomaly, attribution.anomaly_id)
     store = db.get(Store, attribution.store_id)
     return serialize(attribution, anomaly, store)

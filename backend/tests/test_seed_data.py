@@ -1,6 +1,8 @@
 """演示数据集不变量：规模、头条异常数值、渠道一致性、确定性。"""
 from __future__ import annotations
 
+from datetime import date
+
 from scripts.demo_data import HEADLINE_DATE, HEADLINE_IMPACT, build_dataset
 
 from src.services import decompose, detection
@@ -90,3 +92,53 @@ def test_dataset_is_deterministic():
     assert first["meta"] == second["meta"]
     assert first["events"] == second["events"]
     assert first["points"][:50] == second["points"][:50]
+
+
+def _mix_of(points: list[dict], store_code: str, day: date, channel: str) -> dict:
+    for point in points:
+        if point["store_code"] == store_code and point["stat_date"] == day and point["channel"] == channel:
+            return point["room_type_mix"]
+    raise AssertionError(f"缺少指标点 {store_code} {day} {channel}")
+
+
+def test_room_type_mix_reported_per_channel_and_day():
+    """各渠道逐日上报结构：同一门店同一天不同渠道结构不同，且合计≈1。"""
+    data = dataset()
+    points = data["points"]
+    ota = _mix_of(points, "LB-HD-001", date(2026, 10, 20), "ota")
+    corp = _mix_of(points, "LB-HD-001", date(2026, 10, 20), "corp")
+    assert ota != corp
+    for mix in (ota, corp):
+        assert abs(sum(mix.values()) - 1.0) < 0.02
+
+
+def test_headline_suite_suspension_window():
+    """外滩店套房 11-02 ~ 11-08 停售：窗口内各渠道套房占比归零，窗口外恢复。"""
+    data = dataset()
+    points = data["points"]
+    for day in (date(2026, 11, 2), HEADLINE_DATE, date(2026, 11, 8)):
+        for channel in ("ota", "direct", "corp"):
+            assert _mix_of(points, "LB-HD-001", day, channel)["套房"] == 0.0
+    assert _mix_of(points, "LB-HD-001", date(2026, 11, 1), "ota")["套房"] > 0
+    assert _mix_of(points, "LB-HD-001", date(2026, 11, 9), "ota")["套房"] > 0
+
+
+def test_suiteless_brand_never_reports_suite():
+    """轻居品牌门店（如 LB-HB-001）任何渠道任何日期都没有套房 → 归因不再凭空生成套房拖累。"""
+    data = dataset()
+    for point in data["points"]:
+        if point["store_code"] == "LB-HB-001":
+            assert "套房" not in point["room_type_mix"]
+
+
+def test_structure_gap_scenarios_present():
+    """结构缺失 / 占比异常场景落在对应门店的异常日，用于未分配差额路径。"""
+    data = dataset()
+    points = data["points"]
+    # LB-HD-002 异常日 2026-09-30：corp 结构缺失，其余渠道正常
+    assert _mix_of(points, "LB-HD-002", date(2026, 9, 30), "corp") == {}
+    assert _mix_of(points, "LB-HD-002", date(2026, 9, 30), "ota") != {}
+    # LB-HZ-002 异常日 2026-10-06：ota 占比合计 1.65（异常），其余渠道正常
+    abnormal = _mix_of(points, "LB-HZ-002", date(2026, 10, 6), "ota")
+    assert abs(sum(abnormal.values()) - 1.0) > 0.02
+    assert abs(sum(_mix_of(points, "LB-HZ-002", date(2026, 10, 6), "corp").values()) - 1.0) < 0.02

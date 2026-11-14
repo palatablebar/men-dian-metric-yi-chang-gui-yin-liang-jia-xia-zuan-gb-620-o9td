@@ -129,19 +129,52 @@ def channel_split(db: Session, store_id: int, stat_date: date) -> dict[str, floa
     return {channel: float(revenue or 0.0) for channel, revenue in rows}
 
 
-def channel_window(db: Session, store_id: int, start: date, end: date) -> dict[str, list[float]]:
+def channel_window(db: Session, store_id: int, start: date, end: date, is_weekend: bool | None = None) -> dict[str, list[float]]:
+    """分渠道日营收窗口；is_weekend 传入时按周末/工作日分层（与检测基线同口径）。"""
+    conditions = [
+        MetricPoint.store_id == store_id,
+        MetricPoint.stat_date >= start,
+        MetricPoint.stat_date <= end,
+    ]
+    if is_weekend is not None:
+        conditions.append(MetricPoint.is_weekend == is_weekend)
     rows = db.execute(
         select(MetricPoint.channel, MetricPoint.stat_date, func.sum(MetricPoint.revenue))
-        .where(
-            MetricPoint.store_id == store_id,
-            MetricPoint.stat_date >= start,
-            MetricPoint.stat_date <= end,
-        )
+        .where(*conditions)
         .group_by(MetricPoint.channel, MetricPoint.stat_date)
     ).all()
     bucket: dict[str, list[float]] = {}
     for channel, _, revenue in rows:
         bucket.setdefault(channel, []).append(float(revenue or 0.0))
+    return bucket
+
+
+def channel_mixes(db: Session, store_id: int, stat_date: date) -> dict[str, dict]:
+    """各渠道当日上报的房型结构（room_type_mix 原样返回，校验在归因侧做）。"""
+    rows = db.execute(
+        select(MetricPoint.channel, MetricPoint.room_type_mix)
+        .where(MetricPoint.store_id == store_id, MetricPoint.stat_date == stat_date)
+    ).all()
+    return {channel: (mix or {}) for channel, mix in rows}
+
+
+def channel_mix_window(db: Session, store_id: int, start: date, end: date, is_weekend: bool | None = None) -> dict[str, list[dict]]:
+    """基线窗口内各渠道逐日上报的房型结构序列（可按周末/工作日分层）。"""
+    conditions = [
+        MetricPoint.store_id == store_id,
+        MetricPoint.stat_date >= start,
+        MetricPoint.stat_date <= end,
+    ]
+    if is_weekend is not None:
+        conditions.append(MetricPoint.is_weekend == is_weekend)
+    rows = db.execute(
+        select(MetricPoint.channel, MetricPoint.room_type_mix)
+        .where(*conditions)
+        .order_by(MetricPoint.stat_date)
+    ).all()
+    bucket: dict[str, list[dict]] = {}
+    for channel, mix in rows:
+        bucket.setdefault(channel, []).append(mix or {})
     return bucket
 
 

@@ -4,6 +4,17 @@ import { drawer, errorBox, errorMessage, esc, field, kv, table, toast } from '..
 
 function openDetail(view, ctx, report) {
   const snapshot = report.snapshot || {};
+  const drilldown = snapshot.drilldown || {};
+  const version = snapshot.attribution_version || drilldown.version || 1;
+  const dragTable = (items, empty) =>
+    table({
+      rows: (items || []).map((item, index) => ({ id: index, ...item })),
+      columns: [
+        { key: 'key', label: '分组' },
+        { key: 'delta', label: '变动', className: 'num', render: (row) => `<span class="${row.delta < 0 ? 'neg' : 'pos'}">${fmtMoney(row.delta)}</span>` },
+      ],
+      empty: { title: empty, hint: '区间内没有可归因的下钻数据。' },
+    });
   const { root } = drawer({
     title: report.title,
     subtitle: `${report.report_no} · ${report.kind_label} · ${report.status_label}`,
@@ -12,6 +23,7 @@ function openDetail(view, ctx, report) {
       ['异常起数', report.anomaly_count],
       ['影响合计', fmtMoney(report.impact_total)],
       ['生成人', esc(report.generated_by)],
+      ['归因口径版本', `v${esc(version)}（与归因下钻同版）`],
       ['口径', esc(snapshot.method || '—')],
       ['数据窗口', `${esc(snapshot.data_window?.start || '—')} → ${esc(snapshot.data_window?.end || '—')}`],
     ])}
@@ -31,7 +43,19 @@ function openDetail(view, ctx, report) {
         { key: 'impact', label: '影响金额', className: 'num', render: (row) => `<span class="neg">${fmtMoney(row.impact)}</span>` },
         { key: 'count', label: '异常', className: 'num' },
       ],
-    })}`,
+    })}
+    <h3 class="sub-head">渠道拖累（渠道×房型下钻汇总）</h3>
+    ${dragTable(drilldown.channel, '没有渠道下钻数据')}
+    <h3 class="sub-head">房型拖累</h3>
+    ${dragTable(drilldown.room_type, '没有房型下钻数据')}
+    ${
+      drilldown.unallocated_total
+        ? `<h3 class="sub-head">未分配差额</h3>${kv([
+            ['合计', fmtMoney(drilldown.unallocated_total)],
+            ...((drilldown.unallocated_reasons || []).map((item) => [item.reason, `${item.count} 起`])),
+          ])}`
+        : ''
+    }`,
     footer: can(ctx.user.role, 'export:read')
       ? `<div class="footer-actions">
           <button class="btn accent" data-export>导出报告 CSV</button>

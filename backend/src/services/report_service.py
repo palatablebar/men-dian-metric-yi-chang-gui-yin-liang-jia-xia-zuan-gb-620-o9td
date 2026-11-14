@@ -1,4 +1,9 @@
-"""报告服务：日报/周报生成、发布、快照与导出。"""
+"""报告服务：日报/周报生成、发布、快照与导出。
+
+快照与归因下钻引用同一口径版本（room_type_drilldown.ATTRIBUTION_VERSION）：
+- 生成时把区间内归因的版本分布与渠道×房型汇总一并快照，页面与导出同源；
+- 生成为单事务写入：中断时整体回滚，完整旧版报告保持可用，不留半截新版。
+"""
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -8,9 +13,11 @@ from sqlalchemy.orm import Session
 
 from src.constants.enums import METRIC_LABELS, REPORT_KIND_LABELS, REPORT_STATUS_LABELS, SEVERITY_LABELS
 from src.models.anomaly import Anomaly
+from src.models.attribution import Attribution
 from src.models.metric import MetricPoint
 from src.models.report import Report
 from src.models.store import Store
+from src.services import room_type_drilldown
 from src.utils.errors import AppError, not_found
 from src.utils.timeutil import iso_date, iso_utc, local_now, parse_date
 
@@ -39,6 +46,51 @@ def next_report_no(db: Session) -> str:
     prefix = f"RP{local_now():%Y%m%d}"
     count = db.scalar(select(func.count()).select_from(Report).where(Report.report_no.like(f"{prefix}%"))) or 0
     return f"{prefix}-{count + 1:04d}"
+
+
+def _top_drags(bucket: dict[str, float], limit: int = 5) -> list[dict]:
+    rows = [{"key": key, "delta": round(value, 2)} for key, value in bucket.items()]
+    return sorted(rows, key=lambda item: item["delta"])[:limit]
+
+
+def _drilldown_summary(db: Session, start: date, end: date) -> dict:
+    """汇总区间内归因的渠道×房型下钻（与归因页、导出引用同一版本的数据）。"""
+    rows = db.scalars(
+        select(Attribution)
+        .join(Anomaly, Attribution.anomaly_id == Anomaly.id)
+        .where(Anomaly.metric_date >= start, Anomaly.metric_date <= end)
+    ).all()
+    versions: dict[str, int] = {}
+    channel_delta: dict[str, float] = {}
+    room_delta: dict[str, float] = {}
+    unallocated = 0.0
+    reasons: dict[str, int] = {}
+    for attribution in rows:
+        version = attribution.version or 1
+        versions[f"v{version}"] = versions.get(f"v{version}", 0) + 1
+        dimensions = attribution.dimensions or {}
+        drilldown = dimensions.get("channel_room_type") or {}
+        if drilldown.get("channels"):
+            for block in drilldown["channels"]:
+                channel_delta[block["label"]] = channel_delta.get(block["label"], 0.0) + block["delta"]
+                for room in block.get("room_types", []):
+                    room_delta[room["key"]] = room_delta.get(room["key"], 0.0) + room["delta"]
+                gap = block.get("unallocated")
+                if gap:
+                    unallocated += gap["delta"]
+                    reasons[gap["reason"]] = reasons.get(gap["reason"], 0) + 1
+        else:
+            # v1 旧版归因没有渠道×房型块，渠道拖累按其渠道维度行汇总
+            for item in (dimensions.get("channel") or {}).get("rows", []):
+                channel_delta[item["key"]] = channel_delta.get(item["key"], 0.0) + item.get("delta", 0.0)
+    return {
+        "version": room_type_drilldown.ATTRIBUTION_VERSION,
+        "versions": versions,
+        "channel": _top_drags(channel_delta),
+        "room_type": _top_drags(room_delta),
+        "unallocated_total": round(unallocated, 2),
+        "unallocated_reasons": [{"reason": reason, "count": count} for reason, count in sorted(reasons.items())],
+    }
 
 
 def build_snapshot(db: Session, start: date, end: date) -> dict:
@@ -73,7 +125,9 @@ def build_snapshot(db: Session, start: date, end: date) -> dict:
             {"store": item["store"], "code": item["code"], "impact": round(item["impact"], 2), "count": item["count"]}
             for item in drag_rows
         ],
-        "method": "rolling median+MAD (window=28, |z|>=3.5, 同向 2 天)；LMDI 量价分解",
+        "attribution_version": room_type_drilldown.ATTRIBUTION_VERSION,
+        "drilldown": _drilldown_summary(db, start, end),
+        "method": "rolling median+MAD (window=28, |z|>=3.5, 同向 2 天)；LMDI 量价分解；渠道×房型按渠道逐日上报结构分摊",
     }
 
 

@@ -23,6 +23,17 @@ def _bootstrap_database() -> None:
 
     wait_for_db()
     Base.metadata.create_all(bind=engine)
+    _migrate_schema()
+
+
+def _migrate_schema() -> None:
+    """轻量幂等迁移：create_all 不会给既有表补列，这里按需 ALTER（可重复执行）。"""
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        exists = conn.execute(text("SHOW COLUMNS FROM attributions LIKE 'version'")).first()
+        if not exists:
+            conn.execute(text("ALTER TABLE attributions ADD COLUMN version INT NOT NULL DEFAULT 1"))
 
 
 def _run_seed_once() -> None:

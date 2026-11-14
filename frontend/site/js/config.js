@@ -57,6 +57,7 @@ export const ENUMS = {
   reportKind: { daily: '日报', weekly: '周报' },
   reportStatus: { draft: '草稿', published: '已发布' },
   factor: { adr: '房价 ADR', occ: '出租率 OCC', rooms: '可售房量' },
+  drillStatus: { ok: '结构正常', missing_structure: '结构缺失', abnormal_share: '占比异常' },
 };
 
 export function can(role, permission) {

@@ -70,6 +70,7 @@ def store_specs() -> list[dict]:
         if index == 0:
             specs.append(
                 {
+                    "index": index,
                     "code": HEADLINE_STORE,
                     "name": "蓝湾·外滩店",
                     "region": "华东",
@@ -87,6 +88,7 @@ def store_specs() -> list[dict]:
             continue
         specs.append(
             {
+                "index": index,
                 "code": f"LB-{region_code}-{index // len(REGIONS) + 1:03d}",
                 "name": f"蓝湾·{city}{['中心店', '新区店', '机场店', '会展店', '滨江店'][index % 5]}",
                 "region": region_name,
@@ -111,18 +113,60 @@ def room_mix(index: int) -> dict:
     }
 
 
+# 无套房物业（轻居品牌）的基础结构：验证不再凭空生成「套房」拖累
+BASE_MIX_SUITELESS = {"大床房": 0.62, "双床房": 0.38}
+
+# 渠道售卖偏好（合计为 0，不改变门店整体结构）
+CHANNEL_MIX_SHIFT: dict[str, dict[str, float]] = {
+    "ota": {"大床房": 0.04, "双床房": -0.03, "套房": -0.01},
+    "direct": {"大床房": -0.02, "双床房": 0.03, "套房": -0.01},
+    "corp": {"大床房": -0.05, "双床房": 0.01, "套房": 0.04},
+}
+
+# 场景注入（只动 room_type_mix 结构，不动营收/售量，检测口径不受影响）：
+# 1) 外滩店套房楼层 2026-11-02 ~ 2026-11-08 改造停售（覆盖头条异常 11-03）；
+# 2) LB-HD-002 在 2026-09-30（其异常日）corp 渠道结构缺失 —— 对应 seed 复核备注「PMS 补传缺口径」；
+# 3) LB-HZ-002 在 2026-10-06（其异常日）ota 渠道占比合计 1.65 —— 占比异常。
+SUITE_SUSPENSION: dict[str, tuple[date, date]] = {"LB-HD-001": (date(2026, 11, 2), date(2026, 11, 8))}
+MISSING_STRUCTURE: set[tuple[str, date, str]] = {("LB-HD-002", date(2026, 9, 30), "corp")}
+ABNORMAL_STRUCTURE: set[tuple[str, date, str]] = {("LB-HZ-002", date(2026, 10, 6), "ota")}
+
+
+def channel_room_mix(spec: dict, channel: str, day: date) -> dict:
+    """各渠道逐日上报的房型结构（确定性）：门店基础结构 × 渠道偏好 × 逐日微抖动。"""
+    key = (spec["code"], day, channel)
+    if key in MISSING_STRUCTURE:
+        return {}
+    if key in ABNORMAL_STRUCTURE:
+        return {"大床房": 0.9, "双床房": 0.55, "套房": 0.2}
+    base = dict(BASE_MIX_SUITELESS) if spec["brand"] == "蓝湾轻居" else room_mix(spec["index"])
+    shift = CHANNEL_MIX_SHIFT.get(channel, {})
+    jitter = micro(f"{spec['code']}/mix/{channel}", day) * 0.02
+    names = list(base)
+    mix: dict[str, float] = {}
+    for position, name in enumerate(names):
+        delta = jitter if position == 0 else -jitter / (len(names) - 1)
+        mix[name] = max(0.0, base[name] + shift.get(name, 0.0) + delta)
+    start, end = SUITE_SUSPENSION.get(spec["code"], (None, None))
+    if start is not None and start <= day <= end and "套房" in mix:
+        mix["套房"] = 0.0
+    total = sum(mix.values())
+    if total <= 0:
+        return {}
+    return {name: round(value / total, 4) for name, value in mix.items()}
+
+
 def _days() -> list[date]:
     return [START_DATE + timedelta(days=offset) for offset in range(DAYS)]
 
 
 def day_channels(
-    spec: dict, day: date, sold: int, adr: float, rooms: int, index: int, channels: list[tuple[str, float, float]] | None = None
+    spec: dict, day: date, sold: int, adr: float, rooms: int, channels: list[tuple[str, float, float]] | None = None
 ) -> list[dict]:
     """把门店当日售量与均价按渠道拆分（占比固定，均价按系数 + 微抖动浮动）。"""
     channels = channels or CHANNELS
     rows: list[dict] = []
     remaining = sold
-    mix = room_mix(index)
     for position, (channel, share, multiplier) in enumerate(channels):
         if position == len(channels) - 1:
             channel_sold = remaining
@@ -142,7 +186,7 @@ def day_channels(
                 "adr": channel_adr,
                 "revenue": round(channel_adr * channel_sold, 2),
                 "is_weekend": is_weekend(day),
-                "room_type_mix": mix,
+                "room_type_mix": channel_room_mix(spec, channel, day),
             }
         )
     return rows
@@ -192,7 +236,7 @@ def build_series(spec: dict, overrides: dict[date, dict] | None = None) -> list[
             sold = patch.get("sold") or sold
             adr = patch.get("adr") or adr
             channels = EVENT_CHANNELS if patch.get("mix") else CHANNELS
-        rows.append(aggregate(day, day_channels(spec, day, sold, adr, rooms, 0, channels)))
+        rows.append(aggregate(day, day_channels(spec, day, sold, adr, rooms, channels)))
     return rows
 
 
@@ -278,7 +322,7 @@ def _construct(spec: dict, base: dict, day: date, ratio: float, shares: dict) ->
     rooms = max(20, int(round(base["rooms"] * math.exp(shares["rooms"] * log_ratio))))
     sold = max(5, int(round(rooms * base["occ"] * math.exp(shares["occ"] * log_ratio))))
     adr = round(base["adr"] * math.exp(shares["adr"] * log_ratio), 2)
-    revenue = round(sum(row["revenue"] for row in day_channels(spec, day, sold, adr, rooms, 0, EVENT_CHANNELS)), 2)
+    revenue = round(sum(row["revenue"] for row in day_channels(spec, day, sold, adr, rooms, EVENT_CHANNELS)), 2)
     return {"rooms": rooms, "sold": sold, "adr": adr, "revenue": revenue}
 
 
@@ -306,7 +350,7 @@ def _tune_ratio(spec: dict, base: dict, day: date, target_revenue: float, shares
         revenue = round(
             sum(
                 row["revenue"]
-                for row in day_channels(spec, day, best["sold"], adr, best["rooms"], 0, EVENT_CHANNELS)
+                for row in day_channels(spec, day, best["sold"], adr, best["rooms"], EVENT_CHANNELS)
             ),
             2,
         )
@@ -322,7 +366,7 @@ def solve_event(spec: dict, series: list[dict], index: int, target_z: float, sha
     day = series[index]["date"]
     best = _tune_ratio(spec, base, day, target_revenue, shares)
     for _ in range(14):
-        agg = aggregate(day, day_channels(spec, day, best["sold"], best["adr"], best["rooms"], 0, EVENT_CHANNELS))
+        agg = aggregate(day, day_channels(spec, day, best["sold"], best["adr"], best["rooms"], EVENT_CHANNELS))
         current = {"adr": agg["adr"], "occ": agg["occupancy"], "rooms": float(agg["rooms_available"]), "revenue": agg["revenue"]}
         parts = _lodi_shares(base, current)
         if parts is None:
@@ -437,11 +481,9 @@ def build_dataset() -> dict:
         series_by_code[spec["code"]] = series
 
     points: list[dict] = []
-    for index, spec in enumerate(specs):
+    for spec in specs:
         for row in series_by_code[spec["code"]]:
-            for channel_row in row["channels"]:
-                channel_row["room_type_mix"] = room_mix(index)
-                points.append(channel_row)
+            points.extend(row["channels"])
 
     events.sort(key=lambda item: (not item["headline"], item["metric_date"], item["store_code"]))
     return {

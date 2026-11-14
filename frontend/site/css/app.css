@@ -947,6 +947,12 @@ body {
 .pos {
   color: var(--ok);
 }
+.stat.ok .v {
+  color: var(--ok);
+}
+.stat.warn .v {
+  color: var(--warn, var(--danger));
+}
 .right {
   text-align: right;
 }

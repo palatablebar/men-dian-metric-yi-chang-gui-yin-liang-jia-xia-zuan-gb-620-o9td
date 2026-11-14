@@ -9,14 +9,14 @@
 - **三个痛点**：
   1. **跌了不知道哪家店、哪个渠道**：只有总数，没有贡献分解，靠经验猜。
   2. **同比环比混用**：本周比上周、工作日比周末、节假日比平时，基线口径每次都不一样。
-  3. **只看总数，量价混在一起**：营收跌了 8%，是房价降了、出租率掉了，还是有房停售，说不清。
+  3. **只看总数，量价混在一起**：营收跌了 8%，是房价降了、出租率掉了，还是有房停售，说不清；房型长期按固定 52/36/12 分摊，套房停售也会凭空生成「套房拖累」，渠道与房型无法逐层核对。
 - **上下游**：PMS / OTA 渠道 → **本系统（指标接入 → 异常检测 → 量价分解 → 维度归因 → 结论与报告）** → 区域经理复盘 + 经营周会。
 - **一天的工作剧本**：
   1. 07:10 worker 定时复检（`DT20261114-0001`），对 120 家门店的营收序列跑一遍稳健检测。
   2. 07:20 分析师打开总览：`37 起异常 / 影响 -194.6 万 / 34 起待处理`。
   3. 07:25 进「异常清单」，按严重度筛 `高`，看到 `蓝湾·外滩店 2026-11-03 rev z=-4.20 影响 -85,960 元`。
   4. 07:30 点开详情 → 抽屉里核对基线三元组与当期三元组，写处理结论。
-  5. 07:35 跳「归因下钻」：LMDI 拆出 `ADR -62.3% / OCC -31.1% / 可售房量 -7.8%`，渠道维度 `OTA 渠道 -71.0%`。
+  5. 07:35 跳「归因下钻」：LMDI 拆出 `ADR -62.3% / OCC -31.1% / 可售房量 -7.8%`，渠道维度 `OTA 渠道 -71.0%`；展开「渠道 × 房型」选 OTA，看到 `套房 -26,514 元（当期占比 0，套房楼层 11-02 起改造停售）`，对账条显示 `门店Δ = Σ渠道Δ + 口径差异` 逐层对平。
   6. 07:40 把结论一句话贴进周会材料（导出 `attributions.csv`）。
   7. 07:45 管理员生成 `2026-10-26 ~ 2026-11-01 周报` 并发布，区域经理收到 `RP20261114-0001.csv`。
   8. 08:00 审计页回查「谁在什么时候导了哪份明细」。
@@ -38,7 +38,7 @@
 | ① | 门店与指标接入 | `#/stores` 门店与指标 | `store_service` + `metric_service` / `store_controller` | `GET/POST /api/stores`、`PATCH /api/stores/{id}`、`GET /api/stores/{id}/series`、`GET /api/metrics` |
 | ② | 异常检测（算法 A） | `#/anomalies` 异常清单 | `detection` + `run_service` / `run_controller` | `POST /api/runs`、`GET /api/runs`、`GET /api/anomalies` |
 | ③ | 量价分解（算法 B） | `#/attribution` 归因下钻 | `decompose` + `attribution_service` / `attribution_controller` | `GET /api/attributions/anomaly/{anomaly_id}` |
-| ④ | 维度下钻归因 | `#/attribution` 归因下钻 | `attribution_service`（门店/渠道/房型三维） | 同上（`dimensions` 字段） |
+| ④ | 维度下钻归因 | `#/attribution` 归因下钻 | `attribution_service` + `room_type_drilldown`（门店/渠道/房型三维 + 渠道×房型逐层对账） | 同上（`dimensions` 字段） |
 | ⑤ | 结论与处理工单 | `#/anomalies` 异常清单（抽屉） | `anomaly_service` / `anomaly_controller` | `PATCH /api/anomalies/{id}/review` |
 | ⑥ | 报告与导出 | `#/reports` 报告与导出 | `report_service` + `export_service` / `report_controller` + `export_controller` | `POST/PATCH /api/reports`、`GET /api/exports/{anomalies,attributions,channels,reports}.csv` |
 
@@ -91,10 +91,10 @@ cd frontend/site && python -m http.server 5173  # 纯静态站，接口走 /api
 ```text
 backend/
   src/{config,constants,controllers,middlewares,models,routes,schemas,services,utils}
-       services/{detection.py,decompose.py,...}     # 两个算法独立模块（纯函数、可单测）
+       services/{detection.py,decompose.py,room_type_drilldown.py,...}  # 算法模块独立（纯函数、可单测）
   scripts/{demo_data.py,demo_config.py,seed_demo.py,worker_healthcheck.sh}
   migrations/001_core_tables.sql                    # 表结构参考（运行时不执行）
-  tests/{test_detection.py,test_decompose.py,test_seed_data.py,test_permissions.py,test_security.py}
+  tests/{test_detection.py,test_decompose.py,test_room_type_drilldown.py,test_seed_data.py,test_permissions.py,test_security.py}
 frontend/site/{index.html,css/{tokens,app}.css,js/{config,api,store,ui,app}.js,js/pages/*.js}
 docker-compose.yml  .env  README.md
 ```
@@ -106,7 +106,7 @@ docker-compose.yml  .env  README.md
 | `Store` 门店 | `stores` | `code` | model → schema → `store_service` → `store_controller`/`routes/stores` → `api.stores` → 门店页 |
 | `MetricPoint` 指标点 | `metric_points` | `(store_id, stat_date, channel)` | model → `metric_service` → `routes/stores#series`/`routes/metrics` → `api.stores.series` → 门店抽屉 |
 | `Anomaly` 异常 | `anomalies` | `(store_id, metric_date, metric_key)` | model → schema → `anomaly_service` → `anomaly_controller` → `api.anomalies` → 异常清单 |
-| `Attribution` 归因 | `attributions` | `anomaly_id` | model → `attribution_service` → `attribution_controller` → `api.attributions` → 归因页 |
+| `Attribution` 归因 | `attributions` | `anomaly_id` | model → `attribution_service`（含 `version` 口径版本）→ `attribution_controller` → `api.attributions` → 归因页 |
 | `Report` 报告 | `reports` | `report_no` | model → schema → `report_service` → `report_controller` → `api.reports` → 报告页 |
 | `Run` 检测批次 | `runs` | `run_no` / `seed_key` | model → `run_service` → `run_controller` → 异常清单「发起检测」 |
 
@@ -129,7 +129,9 @@ docker-compose.yml  .env  README.md
 - **变动**：`Δrev = rev_cur − rev_base`（base 取算法 A 同一窗口的中位数三元组）。
 - **分解**：`L = Δrev / (ln rev_cur − ln rev_base)`，`part_adr = L·ln(adr_cur/adr_base)`，occ/rooms 同理；三项与 `Δrev` 的差额如实写进 `residual`，不摊派。
 - **占比**：`share_i = part_i / Δrev`；`Δrev` 为 0 → `status="flat"`、占比 null。
-- **维度下钻**：`contribution = 该组 Δ / 总 Δ`，输出 `top_negative` / `top_positive` 各 3 条；维度 = 门店（同区域横向对比）/ 渠道（OTA、直连、协议）/ 房型（按 `room_type_mix` 结构分摊）。
+- **维度下钻**：`contribution = 该组 Δ / 总 Δ`，输出 `top_negative` / `top_positive` 各 3 条；维度 = 门店（同区域横向对比）/ 渠道（OTA、直连、协议）/ 房型（渠道上报结构汇总）。
+- **渠道 × 房型下钻（`backend/src/services/room_type_drilldown.py`，归因口径 v2）**：按各渠道**逐日上报的房型结构**（`metric_points.room_type_mix`）分摊，不再使用固定 52/36/12；基线结构 = 检测窗口内同分层有效上报的均值。逐层对账恒等式：`渠道Δ = Σ房型Δ + 未分配差额`、`门店Δ = Σ渠道Δ + 口径差异`（分渠道中位数基线 vs 门店整体中位数），差额单列、不摊派；结构缺失（`missing_structure`）或占比合计偏离 1 超过 ±2%（`abnormal_share`）时该渠道不向房型分摊，全额计入未分配并写明原因；停售房型（当期占比 0）如实显示为真实拖累，从无该房型的门店不生成该房型行。
+- **幂等与版本**：归因按 `anomaly_id` 唯一，重跑同一异常不重复生成、不改写既有结论；归因行带 `version`（v1 固定分摊 / v2 上报结构），报告快照与归因页引用同一版本；报告/归因生成为单事务写入，中断时整体回滚、完整旧版保持可用。
 - **失败态**：任一因子 ≤ 0 或营收 ≤ 0 → `status="degenerate"`，只回原始三元组与原因。
 - **确定性**：同输入同输出（`test_decompose.py::test_deterministic_output`）。
 

@@ -90,6 +90,7 @@ CREATE TABLE attributions (
   id           BIGINT PRIMARY KEY AUTO_INCREMENT,
   anomaly_id   BIGINT NOT NULL,
   store_id     BIGINT NOT NULL,
+  version      INT NOT NULL DEFAULT 1,   -- 口径版本：1=固定 52/36/12 分摊；2=渠道逐日上报结构+逐层对账
   method       VARCHAR(60) NOT NULL,
   status       VARCHAR(16) NOT NULL,
   base_rev     DOUBLE NOT NULL DEFAULT 0,
